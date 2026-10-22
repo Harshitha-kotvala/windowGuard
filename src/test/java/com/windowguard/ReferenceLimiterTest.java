@@ -46,4 +46,25 @@ class ReferenceLimiterTest {
         l.tryAcquire("A", 5, 10, 1, 100);
         assertThrows(IllegalArgumentException.class, () -> l.tryAcquire("A", 5, 10, 1, 99));
     }
+
+    @Test
+    void retryAfterIsExact() {
+        ReferenceLimiter l = new ReferenceLimiter();
+        l.tryAcquire("A", 3, 10, 1, 1);
+        l.tryAcquire("A", 3, 10, 1, 2);
+        l.tryAcquire("A", 3, 10, 1, 5);
+        Decision d = l.tryAcquire("A", 3, 10, 1, 8);
+        assertFalse(d.allowed());
+        assertEquals(3, d.retryAfterMillis());
+        assertFalse(l.tryAcquire("A", 3, 10, 1, 10).allowed());  // one tick early
+        assertTrue(l.tryAcquire("A", 3, 10, 1, 11).allowed());   // exactly at retry time
+    }
+
+    @Test
+    void costLargerThanLimitNeverFits() {
+        ReferenceLimiter l = new ReferenceLimiter();
+        Decision d = l.tryAcquire("A", 3, 10, 5, 1);
+        assertFalse(d.allowed());
+        assertEquals(-1, d.retryAfterMillis());
+    }
 }

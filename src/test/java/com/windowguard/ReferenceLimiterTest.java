@@ -29,4 +29,21 @@ class ReferenceLimiterTest {
         assertFalse(l.tryAcquire("A", 1, 10, 1, 9).allowed());   // 0 > -1, still inside
         assertTrue(l.tryAcquire("A", 1, 10, 1, 10).allowed());   // 0 > 0 false, expired
     }
+
+    @Test
+    void rejectsInvalidInput() {
+        ReferenceLimiter l = new ReferenceLimiter();
+        assertThrows(IllegalArgumentException.class, () -> l.tryAcquire(null, 1, 10, 1, 0));
+        assertThrows(IllegalArgumentException.class, () -> l.tryAcquire(" ", 1, 10, 1, 0));
+        assertThrows(IllegalArgumentException.class, () -> l.tryAcquire("A", -1, 10, 1, 0));
+        assertThrows(IllegalArgumentException.class, () -> l.tryAcquire("A", 1, 0, 1, 0));
+        assertThrows(IllegalArgumentException.class, () -> l.tryAcquire("A", 1, 10, 0, 0));
+    }
+
+    @Test
+    void rejectsBackwardTimestamp() {
+        ReferenceLimiter l = new ReferenceLimiter();
+        l.tryAcquire("A", 5, 10, 1, 100);
+        assertThrows(IllegalArgumentException.class, () -> l.tryAcquire("A", 5, 10, 1, 99));
+    }
 }

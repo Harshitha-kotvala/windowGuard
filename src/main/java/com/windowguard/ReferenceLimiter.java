@@ -1,6 +1,7 @@
 package com.windowguard;
 import java.util.*;
 public class ReferenceLimiter implements RateLimiter{
+    
     private record Event(long time ,int cost){
 
     }
@@ -13,7 +14,13 @@ public class ReferenceLimiter implements RateLimiter{
             int cost,
             long now
     ) {
+        if (key == null || key.isBlank()) throw new IllegalArgumentException("key");
+        if (limit < 0) throw new IllegalArgumentException("limit");
+        if (windowMillis <= 0) throw new IllegalArgumentException("window");
+        if (cost <= 0) throw new IllegalArgumentException("cost");
         List<Event> events = history.computeIfAbsent(key, k -> new ArrayList<>());
+        if (!events.isEmpty() && now < events.get(events.size() - 1).time())
+        throw new IllegalArgumentException("timestamp went backwards");
         long used=0;
         for(Event e:events){
             if(e.time()>now-windowMillis){

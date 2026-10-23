@@ -34,7 +34,7 @@ public class ReferenceLimiter implements RateLimiter {
         // ---- rejected: everything below is new ----
         int remaining = (int) Math.max(0, limit - used);
         if (cost > limit) {
-            return new Decision(false, remaining, -1);   // can never fit
+           return new Decision(false, remaining, Decision.NEVER);  // can never fit
         }
         long freed = 0;
         for (Event e : events) {
@@ -44,6 +44,6 @@ public class ReferenceLimiter implements RateLimiter {
                 return new Decision(false, remaining, e.time() + windowMillis - now);
             }
         }
-        return new Decision(false, remaining, -1);   // shouldn't be reachable
+        return new Decision(false, remaining, Decision.NEVER);       // shouldn't be reachable
     }
 }

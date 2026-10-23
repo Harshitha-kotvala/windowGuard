@@ -12,6 +12,7 @@ public record Decision(
         int remaining,
         long retryAfterMillis
 ) {
+    public static final long NEVER = Long.MAX_VALUE;   // retryAfter for requests that can never fit
     public Decision {
         if (remaining < 0) {
             throw new IllegalArgumentException(

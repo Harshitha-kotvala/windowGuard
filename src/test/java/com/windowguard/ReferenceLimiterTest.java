@@ -65,6 +65,6 @@ class ReferenceLimiterTest {
         ReferenceLimiter l = new ReferenceLimiter();
         Decision d = l.tryAcquire("A", 3, 10, 5, 1);
         assertFalse(d.allowed());
-        assertEquals(-1, d.retryAfterMillis());
+        assertEquals(Decision.NEVER, d.retryAfterMillis());
     }
 }

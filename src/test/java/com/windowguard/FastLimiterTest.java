@@ -11,7 +11,7 @@ class FastLimiterTest {
         for (int seed = 0; seed < 2000; seed++) {
             Random r = new Random(seed);
             ReferenceLimiter ref = new ReferenceLimiter();
-            FastLimiter fast = new FastLimiter();
+            FastLimiter fast = new FastLimiter(20);
             String[] keys = {"A", "B", "C"};
             Map<String, Long> lastTime = new HashMap<>();
 
@@ -29,5 +29,36 @@ class FastLimiterTest {
                         + " now=" + now + " limit=" + limit + " window=" + window + " cost=" + cost);
             }
         }
+    }
+
+    @Test
+    void longRunMatchesReference() {
+        Random r = new Random(42);
+        ReferenceLimiter ref = new ReferenceLimiter();
+        FastLimiter fast = new FastLimiter(20);
+        long now = 0;
+        for (int i = 0; i < 20_000; i++) {
+            now += r.nextInt(4);
+            int limit = r.nextInt(8);
+            long window = 1 + r.nextInt(20);
+            int cost = 1 + r.nextInt(3);
+            assertEquals(ref.tryAcquire("A", limit, window, cost, now),
+                         fast.tryAcquire("A", limit, window, cost, now), "i=" + i);
+        }
+    }
+
+    @Test
+    void windowLargerThanMaxThrows() {
+        FastLimiter l = new FastLimiter(20);
+        assertThrows(IllegalArgumentException.class, () -> l.tryAcquire("A", 5, 21, 1, 0));
+    }
+
+    @Test
+    void memoryStaysBounded() {
+        FastLimiter l = new FastLimiter(20);
+        for (long t = 0; t < 10_000; t++) {
+            l.tryAcquire("A", 1_000_000, 20, 1, t);
+        }
+        assertTrue(l.liveEvents("A") <= 21, "live=" + l.liveEvents("A"));
     }
 }

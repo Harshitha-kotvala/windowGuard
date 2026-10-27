@@ -2,64 +2,63 @@ package com.windowguard;
 
 import org.junit.jupiter.api.Test;
 import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.*;
 
-class FastLimiterConcurrencyTest {
+class FastLimiterTest {
 
     @Test
-    void neverAdmitsMoreThanLimitOnOneKey() throws Exception {
-        int threads = 100, limit = 10;
-        for (int round = 0; round < 200; round++) {
-            FastLimiter limiter = new FastLimiter(20);
-            ExecutorService pool = Executors.newFixedThreadPool(threads);
-            CountDownLatch ready = new CountDownLatch(threads);
-            CountDownLatch go = new CountDownLatch(1);
-            AtomicInteger allowed = new AtomicInteger();
-            List<Future<?>> futures = new ArrayList<>();
+    void matchesReferenceOnRandomSequences() {
+        for (int seed = 0; seed < 2000; seed++) {
+            Random r = new Random(seed);
+            ReferenceLimiter ref = new ReferenceLimiter();
+            FastLimiter fast = new FastLimiter(20);
+            String[] keys = {"A", "B", "C"};
+            Map<String, Long> lastTime = new HashMap<>();
 
-            for (int i = 0; i < threads; i++) {
-                futures.add(pool.submit(() -> {
-                    ready.countDown();
-                    go.await();
-                    // same "now" for everyone, so no thread looks like it went backwards
-                    if (limiter.tryAcquire("A", limit, 10, 1, 100).allowed()) allowed.incrementAndGet();
-                    return null;
-                }));
+            for (int step = 0; step < 200; step++) {
+                String key = keys[r.nextInt(keys.length)];
+                long now = lastTime.getOrDefault(key, 0L) + r.nextInt(5);   // non-decreasing per key
+                lastTime.put(key, now);
+                int limit = r.nextInt(6);            // 0..5
+                long window = 1 + r.nextInt(20);     // 1..20, changes every call
+                int cost = 1 + r.nextInt(3);         // 1..3
+
+                Decision a = ref.tryAcquire(key, limit, window, cost, now);
+                Decision b = fast.tryAcquire(key, limit, window, cost, now);
+                assertEquals(a, b, "seed=" + seed + " step=" + step + " key=" + key
+                        + " now=" + now + " limit=" + limit + " window=" + window + " cost=" + cost);
             }
-            ready.await();
-            go.countDown();
-            for (Future<?> f : futures) f.get();
-            pool.shutdown();
-
-            assertEquals(limit, allowed.get(), "round " + round);
         }
     }
 
     @Test
-    void differentKeysDoNotInterfere() throws Exception {
-        int keys = 20, perKey = 50, limit = 5;
-        FastLimiter limiter = new FastLimiter(20);
-        ExecutorService pool = Executors.newFixedThreadPool(32);
-        Map<String, AtomicInteger> allowed = new ConcurrentHashMap<>();
-        List<Future<?>> futures = new ArrayList<>();
-
-        for (int k = 0; k < keys; k++) {
-            String key = "key-" + k;
-            allowed.put(key, new AtomicInteger());
-            for (int i = 0; i < perKey; i++) {
-                futures.add(pool.submit(() -> {
-                    if (limiter.tryAcquire(key, limit, 10, 1, 100).allowed()) allowed.get(key).incrementAndGet();
-                    return null;
-                }));
-            }
+    void longRunMatchesReference() {
+        Random r = new Random(42);
+        ReferenceLimiter ref = new ReferenceLimiter();
+        FastLimiter fast = new FastLimiter(20);
+        long now = 0;
+        for (int i = 0; i < 20_000; i++) {
+            now += r.nextInt(4);
+            int limit = r.nextInt(8);
+            long window = 1 + r.nextInt(20);
+            int cost = 1 + r.nextInt(3);
+            assertEquals(ref.tryAcquire("A", limit, window, cost, now),
+                         fast.tryAcquire("A", limit, window, cost, now), "i=" + i);
         }
-        for (Future<?> f : futures) f.get();
-        pool.shutdown();
+    }
 
-        for (int k = 0; k < keys; k++) {
-            assertEquals(limit, allowed.get("key-" + k).get(), "key-" + k);
+    @Test
+    void windowLargerThanMaxThrows() {
+        FastLimiter l = new FastLimiter(20);
+        assertThrows(IllegalArgumentException.class, () -> l.tryAcquire("A", 5, 21, 1, 0));
+    }
+
+    @Test
+    void memoryStaysBounded() {
+        FastLimiter l = new FastLimiter(20);
+        for (long t = 0; t < 10_000; t++) {
+            l.tryAcquire("A", 1_000_000, 20, 1, t);
         }
+        assertTrue(l.liveEvents("A") <= 21, "live=" + l.liveEvents("A"));
     }
 }

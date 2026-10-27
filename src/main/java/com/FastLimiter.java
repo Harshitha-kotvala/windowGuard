@@ -1,6 +1,7 @@
 package com.windowguard;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class FastLimiter implements RateLimiter {
 
@@ -69,7 +70,7 @@ public class FastLimiter implements RateLimiter {
     }
 
     private final long maxWindow;
-    private final Map<String, History> histories = new HashMap<>();
+    private final Map<String, History> histories = new ConcurrentHashMap<>();
 
     public FastLimiter(long maxWindow) {
         if (maxWindow <= 0) throw new IllegalArgumentException("maxWindow");
@@ -85,30 +86,37 @@ public class FastLimiter implements RateLimiter {
         if (cost <= 0) throw new IllegalArgumentException("cost");
 
         History h = histories.computeIfAbsent(key, k -> new History());
-        if (now < h.lastTime) throw new IllegalArgumentException("timestamp went backwards");
 
-        h.evict(now - maxWindow);
+        // one lock per key: same-key calls take turns, different keys never block each other
+        synchronized (h) {
+            if (now < h.lastTime) throw new IllegalArgumentException("timestamp went backwards");
 
-        int first = h.firstAfter(now - windowMillis);
-        long base = h.sumBefore(first);
-        long used = h.total() - base;
+            h.evict(now - maxWindow);
 
-        if (used + cost <= limit) {
-            h.add(now, cost);
-            return new Decision(true, (int) (limit - used - cost), 0);
+            int first = h.firstAfter(now - windowMillis);
+            long base = h.sumBefore(first);
+            long used = h.total() - base;
+
+            if (used + cost <= limit) {
+                h.add(now, cost);
+                return new Decision(true, (int) (limit - used - cost), 0);
+            }
+
+            int remaining = (int) Math.max(0, limit - used);
+            if (cost > limit) return new Decision(false, remaining, Decision.NEVER);
+
+            long need = used + cost - limit;
+            int j = h.firstReaching(first, base, need);
+            return new Decision(false, remaining, h.times[j] + windowMillis - now);
         }
-
-        int remaining = (int) Math.max(0, limit - used);
-        if (cost > limit) return new Decision(false, remaining, Decision.NEVER);
-
-        long need = used + cost - limit;
-        int j = h.firstReaching(first, base, need);
-        return new Decision(false, remaining, h.times[j] + windowMillis - now);
     }
 
     /** for tests: number of events currently retained for a key */
     int liveEvents(String key) {
         History h = histories.get(key);
-        return h == null ? 0 : h.live();
+        if (h == null) return 0;
+        synchronized (h) {
+            return h.live();
+        }
     }
 }

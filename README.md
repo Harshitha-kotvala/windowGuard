@@ -1,106 +1,149 @@
 # WindowGuard
 
-WindowGuard is a small Java library for exact, per-key sliding-window rate
-limiting. It supports weighted requests and reports both remaining quota and
-how long a rejected request should wait before retrying.
+A rate limiter for Java applications. For each incoming request it answers one question:
+*has this client used up its quota in the last N milliseconds?* The limit, the time window
+and the cost of a request can be different on every call, so one client can be checked
+against several policies (for example, 5 OTPs per 10 minutes and 3 promotional messages
+per day).
 
-## Requirements
+It is an exact sliding-window implementation that runs inside a single Java process, with
+bounded memory, safe use from many threads, and a test suite that checks the optimized
+version against a deliberately simple one.
 
-- Java 21+
-- Maven
+## Results at a glance
 
-## Add it to your project
+- **Correct:** the optimized limiter returns the same decision as a simple reference
+  implementation on thousands of randomly generated request sequences, including changing
+  limits, windows and costs.
+- **Fast:** about 45 ns per decision on one thread, and that stays flat as the number of
+  stored requests per client grows from 100 to 10,000 (the simple version slows down
+  linearly: 311 ns, 966 ns, 9,317 ns).
+- **Bounded memory:** about 313 bytes per client with 5 stored requests. Old history and idle
+  clients are removed, so memory does not grow forever.
+- **Thread-safe:** 100 threads hitting one client never admit more than its limit
+  (200 repeated rounds). Different clients never block each other.
 
-WindowGuard is not currently published to a Maven repository. To use it, build
-the project and add the resulting JAR to your application, or include the
-source in your project.
-
-Build the JAR with:
-
-```shell
-mvn package
-```
-
-## Quick start
+## How to use it
 
 ```java
-import com.windowguard.Decision;
-import com.windowguard.FastLimiter;
-import com.windowguard.RateLimiter;
+FastLimiter limiter = new FastLimiter(60_000);   // largest window the limiter will accept
 
-class Example {
-    public static void main(String[] args) {
-        // Retain enough history to serve windows up to 60 seconds.
-        RateLimiter limiter = new FastLimiter(60_000);
+Decision d = limiter.tryAcquire("user-123", 5, 10_000, 1, nowMillis);
+//                              client      limit window  cost  time
 
-        long now = System.currentTimeMillis();
-        Decision decision = limiter.tryAcquire(
-                "customer-123",
-                100,       // maximum cost in the window
-                60_000,    // window length in milliseconds
-                1,         // cost of this request
-                now
-        );
-
-        if (decision.allowed()) {
-            System.out.println("Allowed; remaining quota: " + decision.remaining());
-        } else if (decision.retryAfterMillis() == Decision.NEVER) {
-            System.out.println("This request can never fit within the configured limit.");
-        } else {
-            System.out.println("Rejected; retry after "
-                    + decision.retryAfterMillis() + " ms.");
-        }
-    }
+if (d.allowed()) {
+    // handle the request; d.remaining() units are left in this window
+} else {
+    // reject (for example with HTTP 429); try again after d.retryAfterMillis()
+    // retryAfterMillis is Decision.NEVER if the request can never fit (cost > limit)
 }
+
+limiter.sweep(nowMillis);   // call periodically to release clients that went quiet
 ```
 
-Use a stable key for each client or other identity whose usage should be
-counted independently. The caller supplies the current time in milliseconds;
-timestamps for a key must not go backwards.
+A request is allowed when `used + cost <= limit`, where `used` is the total cost of the
+requests already accepted for that client inside the window.
 
-## Behavior
+## Behaviour, precisely
 
-- Each key has an independent quota.
-- A request is allowed when its cost plus the cost of accepted requests still
-  inside the window is no greater than the limit.
-- The window is `(now - windowMillis, now]`: an event exactly at the left
-  boundary has expired.
-- Rejected requests do not consume quota.
-- `remaining` is the available quota after the decision; it is zero when the
-  current usage already meets or exceeds the limit.
-- For a rejection, `retryAfterMillis` is the earliest delay until enough
-  recorded cost expires for that request to fit, assuming no intervening
-  requests. It is `Decision.NEVER` when the request cost itself exceeds the
-  limit.
-- Keys must be non-null and non-blank; limits must be non-negative; request
-  costs and window lengths must be positive.
-- `FastLimiter` requires a positive `maxWindow`, and rejects requests for
-  windows longer than it. That bound lets it evict history that cannot be used
-  by any supported window.
+- The window is `(now - window, now]`. A request exactly `window` ago no longer counts.
+- Rejected requests are not recorded and use no quota.
+- Limit and window may change on every call, even for the same client.
+- `retryAfterMillis` is exact: the time until enough older requests leave the window for this
+  one to fit.
+- Time is supplied by the caller and must not go backwards for a given client; requests from
+  different clients can be interleaved freely. This also makes the limiter fully
+  deterministic to test.
+- Invalid input (blank client, negative limit, non-positive window or cost, a window larger
+  than the configured maximum, a timestamp that goes backwards) is rejected with an
+  `IllegalArgumentException` instead of silently corrupting a counter.
 
-## Implementations
+## Design decisions
 
-| Class | Purpose |
-| --- | --- |
-| `FastLimiter` | Optimized implementation using per-key timestamp and cumulative-cost arrays with binary search. Configure its maximum supported window at construction. |
-| `ReferenceLimiter` | Simple implementation that scans request history. Useful as a readable reference and correctness oracle; it does not impose a maximum window. |
+**Exact log of requests instead of counters.** Each client keeps the timestamps of its
+accepted requests. That gives exact answers and supports a different window on every call,
+which a fixed-window counter cannot do. The cost is memory proportional to the requests inside
+the window, which the next decisions keep under control.
 
-Both implementations are in the `com.windowguard` package and implement
-`RateLimiter`. `FastLimiter` currently uses mutable in-memory state and is not
-thread-safe; use it from a single thread unless synchronization is provided by
-the caller.
+**Binary search plus prefix sums.** A client's timestamps are already sorted because time
+does not go backwards, so the start of the window is found with a binary search, O(log n),
+instead of scanning. Costs are stored as running totals, so the quota used in any window is
+one subtraction. A single running total would not work, because the window changes on every
+call.
 
-## Run the tests
+**Retention by a maximum window, not by the current request's window.** If a request with a
+10-second window deleted older history, the next request asking for a 60-second window would
+be undercounted. So history is kept up to a configured maximum window, requests asking for a
+larger window are rejected, and anything older than the maximum can never matter and is
+dropped. Freed array space is reused by compaction.
 
-```shell
-mvn test
+**One lock per client.** Checking the quota and recording the request happen as one step under
+the client's own lock. Without that, two threads can both see room for one more request and
+both be admitted. Different clients use different locks and proceed in parallel.
+
+**Safe cleanup of idle clients.** `sweep` removes clients with no recent requests. A subtle
+race exists here: a request can fetch a client's history just before the sweeper removes it,
+then record into a history nobody can reach, losing that request. Each history carries a
+"retired" flag that is set and checked under the same lock, so a request that finds a retired
+history discards it and retries with a fresh one. The caller schedules `sweep`; the library
+starts no background threads.
+
+## How it is tested
+
+- **Reference implementation.** `ReferenceLimiter` is a short list-and-loop version that never
+  deletes anything. It is slow but easy to verify by reading, and it acts as the answer key.
+- **Differential tests.** The optimized limiter must match the reference on every field of
+  every decision (allowed, remaining, retry delay): 2,000 random sequences of 200 requests
+  across several clients with varying limits, windows and costs, plus a 20,000-request run on
+  one client that forces repeated array growth and compaction.
+- **Concurrency tests.** 100 threads on one client over 200 rounds (never more than the limit
+  admitted), 20 clients in parallel, and a sweeper running continuously against live
+  requests with no accepted request lost.
+- **Boundary and input tests.** Window edges, rejected requests, exact retry times,
+  oversized costs, and every invalid-input rule.
+- **Memory test.** After 10,000 requests on one client, only the events inside the maximum
+  window are retained.
+- Each test was checked by deliberately breaking the code it covers and confirming the test
+  fails. 19 tests in total; run them with `mvn test`.
+
+## Benchmark
+
+A timing loop with warm-up (`src/test/java/com/windowguard/Bench.java`), not a full JMH suite.
+One thread, one client, every request accepted, one request per time unit, window equal to the
+history size. JDK 23.0.1, 12 cores. Treat the figures as indicative.
+
+| Stored requests per client | Simple reference (ns/op) | WindowGuard (ns/op) |
+|---------------------------:|-------------------------:|--------------------:|
+| 100                        | 311                      | 45                  |
+| 1,000                      | 966                      | 42                  |
+| 10,000                     | 9,317                    | 46                  |
+
+The reference never deletes history, so it scans every request it has ever accepted, which is
+exactly the cost the optimized version removes. Memory is about 313 bytes per client at 5
+stored requests (client name included, approximate).
+
+## Scope
+
+Runs inside one Java process, with time supplied by the caller. It is a library component
+you embed in an application, not a standalone service.
+
+## Project layout
+
+```
+src/main/java/com/windowguard/
+  RateLimiter.java          interface
+  Decision.java             result: allowed, remaining, retryAfterMillis
+  ReferenceLimiter.java     simple, obviously-correct version used as the answer key
+  FastLimiter.java          the optimized, thread-safe implementation
+src/test/java/com/windowguard/
+  ...Test.java              unit, differential, concurrency and cleanup tests
+  Bench.java                benchmark
+docs/                       requirements and design notes
 ```
 
-The tests cover window boundaries, validation, retry timing, and randomized
-differential comparisons between `FastLimiter` and `ReferenceLimiter`.
+## Build
 
-## Current scope
+Requires Java 21+ and Maven: `mvn test`
 
-WindowGuard is an in-memory, single-process library. It does not currently
-provide distributed quota coordination, idle-key cleanup, or built-in
-thread-safety.
+---
+Harshitha Kotvala

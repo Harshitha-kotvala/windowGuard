@@ -11,6 +11,7 @@ public class FastLimiter implements RateLimiter {
         int head = 0;               // live events are slots [head, size)
         int size = 0;
         long lastTime = Long.MIN_VALUE;   // last accepted timestamp, survives eviction
+        boolean retired = false;          // set by the sweeper, read under the lock
 
         long total() { return size == 0 ? 0 : cum[size - 1]; }
         long sumBefore(int i) { return i == 0 ? 0 : cum[i - 1]; }
@@ -85,30 +86,64 @@ public class FastLimiter implements RateLimiter {
         if (windowMillis > maxWindow) throw new IllegalArgumentException("window exceeds maxWindow");
         if (cost <= 0) throw new IllegalArgumentException("cost");
 
-        History h = histories.computeIfAbsent(key, k -> new History());
+        while (true) {
+            History h = histories.computeIfAbsent(key, k -> new History());
 
-        // one lock per key: same-key calls take turns, different keys never block each other
-        synchronized (h) {
-            if (now < h.lastTime) throw new IllegalArgumentException("timestamp went backwards");
+            // one lock per key: same-key calls take turns, different keys never block each other
+            synchronized (h) {
+                if (h.retired) {
+                    // the sweeper removed this history after we fetched it: drop it, fetch a fresh one
+                    histories.remove(key, h);
+                    continue;
+                }
 
-            h.evict(now - maxWindow);
+                if (now < h.lastTime) throw new IllegalArgumentException("timestamp went backwards");
 
-            int first = h.firstAfter(now - windowMillis);
-            long base = h.sumBefore(first);
-            long used = h.total() - base;
+                h.evict(now - maxWindow);
 
-            if (used + cost <= limit) {
-                h.add(now, cost);
-                return new Decision(true, (int) (limit - used - cost), 0);
+                int first = h.firstAfter(now - windowMillis);
+                long base = h.sumBefore(first);
+                long used = h.total() - base;
+
+                if (used + cost <= limit) {
+                    h.add(now, cost);
+                    return new Decision(true, (int) (limit - used - cost), 0);
+                }
+
+                int remaining = (int) Math.max(0, limit - used);
+                if (cost > limit) return new Decision(false, remaining, Decision.NEVER);
+
+                long need = used + cost - limit;
+                int j = h.firstReaching(first, base, need);
+                return new Decision(false, remaining, h.times[j] + windowMillis - now);
             }
-
-            int remaining = (int) Math.max(0, limit - used);
-            if (cost > limit) return new Decision(false, remaining, Decision.NEVER);
-
-            long need = used + cost - limit;
-            int j = h.firstReaching(first, base, need);
-            return new Decision(false, remaining, h.times[j] + windowMillis - now);
         }
+    }
+
+    /**
+     * Removes keys with no events newer than (now - maxWindow). Returns how many were removed.
+     * 'now' must come from the same time source as the request timestamps; a 'now' that runs
+     * ahead of a key's real timestamps discards history that was still needed.
+     */
+    public int sweep(long now) {
+        long cutoff = now - maxWindow;
+        int removed = 0;
+        for (Map.Entry<String, History> e : histories.entrySet()) {
+            History h = e.getValue();
+            synchronized (h) {
+                if (!h.retired && h.lastTime <= cutoff) {
+                    h.retired = true;
+                    histories.remove(e.getKey(), h);
+                    removed++;
+                }
+            }
+        }
+        return removed;
+    }
+
+    /** for tests: number of keys currently held */
+    int keyCount() {
+        return histories.size();
     }
 
     /** for tests: number of events currently retained for a key */
